@@ -1,0 +1,422 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Meetup — Room call</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Roboto, "Segoe UI", Arial; margin: 12px; background:#f6f7fb; color:#111 }
+    header { display:flex; gap:12px; align-items:center; margin-bottom:12px }
+    h1 { font-size:18px; margin:0 }
+    .controls { display:flex; gap:8px; align-items:center }
+    input[type=text] { padding:8px; border-radius:6px; border:1px solid #d0d3da; min-width:220px }
+    button { padding:8px 12px; border-radius:6px; border:0; background:#2f80ed; color:white; cursor:pointer }
+    button.secondary { background:#6b7280 }
+    #videos { display:grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap:10px; margin-top:12px }
+    video, canvas { width:100%; height:auto; background:black; border-radius:8px; }
+    .status { margin-top:8px; color:#444 }
+    .small { font-size:13px; color:#666 }
+    footer { margin-top:18px; font-size:13px; color:#666 }
+    a.vsix { color:#1b6edb; text-decoration:underline }
+  </style>
+</head>
+<body>
+  <header>
+    <div>
+      <h1>Meetup — Room call (browser client)</h1>
+      <div class="small">Enter a room id, create a room, or open this page with <code>?room=room-xyz</code></div>
+    </div>
+  </header>
+
+  <div class="controls">
+    <input id="roomId" type="text" placeholder="room-abc123" />
+    <button id="createBtn">Create & Join</button>
+    <button id="joinBtn">Join</button>
+    <button id="leaveBtn" class="secondary" disabled>Leave</button>
+    <div style="flex:1"></div>
+    <button id="toggleAudio" class="secondary">Mute</button>
+    <button id="toggleVideo" class="secondary">Video Off</button>
+  </div>
+
+  <div class="status" id="status">Not connected to signaling server</div>
+
+  <div id="videos">
+    <div>
+      <div class="small">Local</div>
+      <video id="localVideo" autoplay muted playsinline></video>
+    </div>
+    <!-- remote videos will be appended here -->
+  </div>
+
+  <footer>
+    <div class="small">
+      Download extension (optional): <a class="vsix" href="file:///mnt/data/meetup-0.0.1.vsix">meetup-0.0.1.vsix</a>
+      — or open this page on multiple machines/browsers and share Room ID.
+    </div>
+  </footer>
+
+<script>
+(async function() {
+  // CONFIG: signaling server URL (use wss for deployed server)
+  const SIGNALING = (location.protocol === 'https:' ? 'wss://' : 'ws://') + 'signaling-server-ai81.onrender.com';
+  // If you use a different host, change above or provide query param ?signaling=
+  console.log('Using signaling server:', SIGNALING);
+
+  const roomInput = document.getElementById('roomId');
+  const createBtn = document.getElementById('createBtn');
+  const joinBtn = document.getElementById('joinBtn');
+  const leaveBtn = document.getElementById('leaveBtn');
+  const statusEl = document.getElementById('status');
+  const localVideo = document.getElementById('localVideo');
+  const videosGrid = document.getElementById('videos');
+  const toggleAudioBtn = document.getElementById('toggleAudio');
+  const toggleVideoBtn = document.getElementById('toggleVideo');
+
+  let ws = null;
+  let myPeerId = null;
+  let roomId = null;
+  const peers = new Map(); // peerId -> RTCPeerConnection
+  const dataChannels = new Map();
+
+  // get room from query param if present
+  const params = new URLSearchParams(location.search);
+  const paramRoom = params.get('room');
+  if (paramRoom) roomInput.value = paramRoom;
+
+  // init local media
+  let localStream = null;
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+    localVideo.srcObject = localStream;
+  } catch (err) {
+    console.warn('getUserMedia failed', err);
+    statusEl.textContent = 'Camera/mic access denied or unavailable';
+  }
+
+  // connect ws
+  function connectWS() {
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) return;
+    ws = new WebSocket(SIGNALING);
+    ws.onopen = () => {
+      statusEl.textContent = 'Connected to signaling server';
+      console.log('WS open');
+    };
+    ws.onmessage = (ev) => {
+      try {
+        const msg = JSON.parse(ev.data);
+        handleSignal(msg);
+      } catch (e) {
+        console.error('Bad msg', e, ev.data);
+      }
+    };
+    ws.onclose = () => {
+      statusEl.textContent = 'Disconnected from signaling server';
+      console.log('WS closed');
+    };
+    ws.onerror = (e) => {
+      console.error('WS error', e);
+      statusEl.textContent = 'Signaling error';
+    };
+  }
+
+  // generate local unique id (server will also assign one)
+  function generateId() {
+    return 'peer-' + Date.now().toString(36) + '-' + Math.random().toString(36).slice(2,6);
+  }
+
+  // send to server
+  function send(msg) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      ws.send(JSON.stringify(msg));
+    } else {
+      console.warn('WS not open', msg);
+    }
+  }
+
+  // signaling handlers
+  async function handleSignal(msg) {
+    const { type, data, from } = msg;
+    switch (type) {
+      case 'peerId':
+        myPeerId = data;
+        statusEl.textContent = 'Assigned peerId: ' + myPeerId + (roomId ? ' — in room ' + roomId : '');
+        break;
+
+      case 'roomPeers':
+        // data = array of { id, timestamp } or strings
+        console.log('roomPeers', data);
+        if (Array.isArray(data)) {
+          for (const p of data) {
+            const id = typeof p === 'string' ? p : p.id;
+            // skip if already connected
+            if (id && id !== myPeerId && !peers.has(id)) {
+              await createOffer(id);
+            }
+          }
+        }
+        updateMemberList(data || []);
+        break;
+
+      case 'peerJoined':
+        console.log('peerJoined', data);
+        if (data && data.peerId && data.peerId !== myPeerId) {
+          updateMemberListAdd(data.peerId);
+          await createOffer(data.peerId);
+        }
+        break;
+
+      case 'peerLeft':
+        console.log('peerLeft', data);
+        if (data && data.peerId) {
+          closePeer(data.peerId);
+          updateMemberListRemove(data.peerId);
+        }
+        break;
+
+      case 'offer':
+        console.log('offer from', from);
+        await handleOffer(from, data);
+        break;
+
+      case 'answer':
+        console.log('answer from', from);
+        await handleAnswer(from, data);
+        break;
+
+      case 'iceCandidate':
+        await handleRemoteIce(from, data);
+        break;
+
+      default:
+        console.warn('unknown', msg);
+    }
+  }
+
+  // ROOM API
+  function joinRoom(rid) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) connectWS();
+    roomId = rid;
+    send({ type: 'joinRoom', roomId: roomId });
+    statusEl.textContent = 'Joining room ' + roomId + '...';
+    leaveBtn.disabled = false;
+  }
+
+  function leaveRoom() {
+    if (roomId) {
+      send({ type: 'leaveRoom' });
+      roomId = null;
+      leaveBtn.disabled = true;
+      // close peer connections
+      for (const id of Array.from(peers.keys())) closePeer(id);
+      clearMemberList();
+      statusEl.textContent = 'Left room';
+    }
+  }
+
+  // ICE / Peer helpers
+  function createRTCPeer(id) {
+    const pc = new RTCPeerConnection({
+      iceServers: [
+        { urls: 'stun:stun.l.google.com:19302' }
+        // TODO: add TURN server for real-world NAT traversal
+      ]
+    });
+
+    pc.onicecandidate = (ev) => {
+      if (ev.candidate) {
+        send({ type: 'iceCandidate', to: id, data: ev.candidate });
+      }
+    };
+
+    pc.ontrack = (ev) => {
+      attachRemoteStream(id, ev.streams[0]);
+    };
+
+    pc.onconnectionstatechange = () => {
+      console.log('pc state', id, pc.connectionState);
+    };
+
+    // data channel (optional): use for frames or messages
+    try {
+      const dc = pc.createDataChannel('chat');
+      dc.onopen = () => console.log('DC open', id);
+      dc.onmessage = (e) => { console.log('dc msg', id, e.data); };
+      dataChannels.set(id, dc);
+    } catch (e) {
+      console.warn('createDataChannel failed', e);
+    }
+
+    pc.ondatachannel = (ev) => {
+      const dc = ev.channel;
+      dc.onmessage = (e) => { console.log('remote dc msg', id, e.data); };
+      dataChannels.set(id, dc);
+    };
+
+    // add local tracks
+    if (localStream) {
+      localStream.getTracks().forEach(t => pc.addTrack(t, localStream));
+    }
+
+    peers.set(id, pc);
+    return pc;
+  }
+
+  async function createOffer(id) {
+    const pc = createRTCPeer(id);
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      send({ type: 'offer', to: id, data: offer });
+      console.log('sent offer to', id);
+    } catch (err) {
+      console.error('createOffer err', err);
+    }
+  }
+
+  async function handleOffer(fromId, offer) {
+    if (!peers.has(fromId)) createRTCPeer(fromId);
+    const pc = peers.get(fromId);
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(offer));
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      send({ type: 'answer', to: fromId, data: answer });
+      console.log('sent answer to', fromId);
+    } catch (err) {
+      console.error('handleOffer err', err);
+    }
+  }
+
+  async function handleAnswer(fromId, answer) {
+    const pc = peers.get(fromId);
+    if (!pc) { console.warn('no pc for answer', fromId); return; }
+    try {
+      await pc.setRemoteDescription(new RTCSessionDescription(answer));
+    } catch (err) {
+      console.error('handleAnswer err', err);
+    }
+  }
+
+  async function handleRemoteIce(fromId, cand) {
+    const pc = peers.get(fromId);
+    if (!pc) return;
+    try {
+      await pc.addIceCandidate(new RTCIceCandidate(cand));
+    } catch (err) {
+      console.warn('addIce err', err);
+    }
+  }
+
+  function closePeer(id) {
+    const pc = peers.get(id);
+    if (pc) {
+      try { pc.close(); } catch {}
+      peers.delete(id);
+    }
+    const dc = dataChannels.get(id);
+    if (dc) {
+      try { dc.close(); } catch {}
+      dataChannels.delete(id);
+    }
+    // remove remote video element
+    const node = document.getElementById('remote-' + id);
+    if (node) node.remove();
+  }
+
+  // remote video handling
+  function attachRemoteStream(peerId, stream) {
+    let vid = document.getElementById('remote-' + peerId);
+    if (!vid) {
+      const wrapper = document.createElement('div');
+      wrapper.innerHTML = '<div class="small">Remote - ' + peerId + '</div>';
+      vid = document.createElement('video');
+      vid.id = 'remote-' + peerId;
+      vid.autoplay = true;
+      vid.playsInline = true;
+      vid.srcObject = stream;
+      wrapper.appendChild(vid);
+      videosGrid.appendChild(wrapper);
+    } else {
+      vid.srcObject = stream;
+    }
+  }
+
+  // UI member list helpers
+  function updateMemberList(list) {
+    clearMemberList();
+    (list || []).forEach(p => {
+      const id = typeof p === 'string' ? p : p.id;
+      updateMemberListAdd(id);
+    });
+  }
+
+  function updateMemberListAdd(id) {
+    if (!id) return;
+    // create small element
+    const exists = Array.from(peersContainer.children).some(c => c.textContent === id);
+    if (exists) return;
+    const el = document.createElement('div');
+    el.textContent = id;
+    el.style.padding = '6px';
+    el.style.border = '1px solid #e0e3ea';
+    el.style.borderRadius = '6px';
+    el.style.background = '#fff';
+    el.style.marginBottom = '6px';
+    peersContainer.appendChild(el);
+  }
+
+  function updateMemberListRemove(id) {
+    Array.from(peersContainer.children).forEach(ch => {
+      if (ch.textContent === id) ch.remove();
+    });
+  }
+
+  function clearMemberList() {
+    peersContainer.innerHTML = '';
+  }
+
+  // button events
+  createBtn.onclick = () => {
+    const id = 'room-' + Math.random().toString(36).slice(2,9);
+    roomInput.value = id;
+    connectWS();
+    joinRoom(id);
+  };
+
+  joinBtn.onclick = () => {
+    const rid = roomInput.value.trim();
+    if (!rid) { alert('Enter a room id'); return; }
+    connectWS();
+    joinRoom(rid);
+  };
+
+  leaveBtn.onclick = () => {
+    leaveRoom();
+  };
+
+  toggleAudioBtn.onclick = () => {
+    if (!localStream) return;
+    const track = localStream.getAudioTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    toggleAudioBtn.textContent = track.enabled ? 'Mute' : 'Unmute';
+  };
+
+  toggleVideoBtn.onclick = () => {
+    if (!localStream) return;
+    const track = localStream.getVideoTracks()[0];
+    if (!track) return;
+    track.enabled = !track.enabled;
+    toggleVideoBtn.textContent = track.enabled ? 'Video Off' : 'Video On';
+  };
+
+  // auto-join if the page has ?room=...
+  if (roomInput.value) {
+    connectWS();
+    joinRoom(roomInput.value);
+  }
+
+})();
+</script>
+</body>
+</html>
